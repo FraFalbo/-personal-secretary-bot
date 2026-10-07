@@ -1,12 +1,11 @@
 """Personal Secretary Bot - Main Entry Point
-Fixed polling with proper event loop handling for Render Free Tier
-Bot risponde SEMPRE a ogni messaggio!
+Async approach: Telegram polling integrated with FastAPI event loop
+Bot risponde SEMPRE a ogni messaggio! No threading complications.
 """
 
 import os
 import asyncio
 import logging
-import threading
 from pathlib import Path
 from dotenv import load_dotenv
 import telebot
@@ -124,26 +123,39 @@ Possibili: "calendar", "email", "general". Restituisci SOLO il nome."""
     agent_name = response.strip().lower()
     return agent_name if agent_name in ["calendar", "email", "general"] else "general"
 
-# === Critical: Polling with proper event loop per thread ===
-def run_bot_polling():
-    """Funzione che avvia il polling Telegram in un thread con proprio event loop."""
+# === Critical: Startup task for Telegram Polling ===
+# Avviamo il polling Telegram come task asyncio dentro il loop di FastAPI
+# Questo evita l'errore "no current event loop in thread" perché tutto gira nello stesso loop
+
+async def start_bot_polling():
+    """Funzione async che avvia il polling Telegram."""
     try:
-        # Crea un event loop dedicato per questo thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        try:
-            bot.polling(none_stop=True, interval=2, timeout=20)
-        finally:
-            loop.close()
+        # none_stop=True fa sì che il polling continui indefinitamente
+        # interval=2 controlla ogni 2 secondi nuovi messaggi
+        # timeout=20 attende 20 secondi senza messaggi prima di riavviare
+        bot.polling(none_stop=True, interval=2, timeout=20)
     except Exception as e:
-        logging.error(f"Errore critico polling Telegram: {e}")
+        logging.error(f"Errore polling Telegram: {e}")
+        # In caso di errore, riprova dopo un po'
+        await asyncio.sleep(5)
+        asyncio.create_task(start_bot_polling())
 
-# Avvia il polling in background thread
-polling_thread = threading.Thread(target=run_bot_polling, daemon=True)
-polling_thread.start()
+# === FastAPI Lifespan Events ===
+@app.on_event("startup")
+async def startup_event():
+    logging.info("🚀 Avvio Segretaria Personale Bot...")
+    # Avvia il polling Telegram in background nel loop di FastAPI
+    asyncio.create_task(start_bot_polling())
+    logging.info("✅ Polling Telegram avviato nel loop async")
 
-logging.info("🚀 Avvio Segretaria Personale Bot - Polling Telegram avviato in background")
+@app.on_event("shutdown")
+async def shutdown_event():
+    logging.info("🛑 Spegnimento...")
+    try:
+        bot.stop_polling()
+    except:
+        pass
+    logging.info("✅ Spento")
 
 # === FastAPI Routes ===
 
@@ -200,38 +212,34 @@ def cmd_email(message):
 def handle_all_messages(message):
     """Handler PRINCIPALE: risponde SEMPRE a ogni messaggio.
     
-    Questa funzione garantisce che NESSUN messaggio venga ignorato.
-    Usa: agente specifico → LLM → fallback educato.
+    Logica a 3 livelli:
+    1. Agente specifico (Calendar/Email) se riconosciuto
+    2. LLM Nemotron come fallback intelligente
+    3. Messaggio educato se nulla altro funziona
     """
     text = message.text or ""
     
-    # 1. Prova il routing LLM per trovare un agente
+    # 1. Prima prova il routing LLM per trovare un agente
     agent_name = asyncio.get_event_loop().run_until_complete(route_message(text))
     agent = agent_registry.get_agent(agent_name)
     
     # 2. Se c'è un agente, provalo
     if agent:
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(agent.handle_message(message, text))
-            else:
-                resp = loop.run_until_complete(agent.handle_message(message, text))
-                if resp:
-                    bot.send_message(message.chat.id, resp, parse_mode="HTML")
-                    return
+            resp = await agent.handle_message(message, text)
+            if resp:
+                bot.send_message(message.chat.id, resp, parse_mode="HTML")
+                return
         except Exception as e:
             logging.error(f"Errore agente {agent_name}: {e}")
     
-    # 3. FALLBACK: LLM se nessun agente ha risposto
+    # 3. FALLBACK: LLM Nemotron se nessun agente ha risposto
     if llm_client:
         try:
             sys_prompt = f"""Sei la Segretaria Personale AI amichevole.
 L'utente ha scritto: "{text}"
 Rispondi in italiano in modo conciso (max 2 frasi). Se non sai qualcosa, dillo onestamente."""
-            resp = asyncio.get_event_loop().run_until_complete(
-                llm_client.chat(message=text, system_prompt=sys_prompt)
-            )
+            resp = await llm_client.chat(message=text, system_prompt=sys_prompt)
             if resp and resp.strip():
                 bot.send_message(message.chat.id, resp, parse_mode="HTML")
                 return
@@ -250,20 +258,14 @@ Rispondi in italiano in modo conciso (max 2 frasi). Se non sai qualcosa, dillo o
         parse_mode="HTML"
     )
 
-# === Lifespan Events ===
-@app.on_event("startup")
-def startup_event():
-    logging.info("✅ Bot avviato - Polling Telegram in esecuzione in background thread")
-    logging.info("🔒 Garanzia: ogni messaggio riceverà una risposta")
+# === Root GET (alternativa al /telegram webhook) ===
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Bot attivo"}
 
-@app.on_event("shutdown")
-def shutdown_event():
-    logging.info("🛑 Spegnimento...")
-    try:
-        bot.stop_polling()
-    except:
-        pass
-    logging.info("✅ Spento")
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
