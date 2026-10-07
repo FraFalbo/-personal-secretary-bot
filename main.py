@@ -1,11 +1,12 @@
 """Personal Secretary Bot - Main Entry Point
-Uses Telegram Polling (works on Render Free Tier)
+Fixed polling with proper event loop handling for Render Free Tier
 Bot risponde SEMPRE a ogni messaggio!
 """
 
 import os
 import asyncio
 import logging
+import threading
 from pathlib import Path
 from dotenv import load_dotenv
 import telebot
@@ -22,10 +23,10 @@ NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN non trovato nelle variabili d'ambiente!")
 
-# Initialize Bot with POLLING (not webhooks!)
+# Initialize Bot
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode="HTML")
 
-# FastAPI app - minimal
+# FastAPI app
 app = FastAPI(title="Segretaria Personale Bot", description="Bot Telegram multi-agente")
 
 # === NVIDIA Nemotron LLM Client ===
@@ -68,7 +69,7 @@ class NemotronClient:
                 return data["choices"][0]["message"]["content"]
             except Exception as e:
                 logging.error(f"Errore Nemotron API: {e}")
-                return "⚠️ Mi dispiace, c'è stato un errore nella comunicazione con l'AI. Per favore riprova tra un momento."
+                return "⚠️ Mi dispiace, c'è stato un errore nella comunicazione con l'AI."
 
 # Create LLM client
 llm_client: NemotronClient | None = None
@@ -76,7 +77,7 @@ if NVIDIA_API_KEY:
     llm_client = NemotronClient(NVIDIA_API_KEY)
     logging.info("✅ Client Nemotron inizializzato")
 else:
-    logging.warning("⚠️ NVIDIA_API_KEY non trovato - LLM disabilitato, ma i comandi base funzionano")
+    logging.warning("⚠️ NVIDIA_API_KEY non trovato - LLM disabilitato ma comandi base funzionano")
 
 # === Base Agent Interface ===
 from abc import ABC, abstractmethod
@@ -115,28 +116,44 @@ async def route_message(text: str) -> str | None:
         return None
     system_prompt = """Sei un router NLP per un bot segretaria personale.
 Analizza l'input e determina quale agente gestirlo.
-Possibili: "calendar", "email", "general". Restituisci SOLO il nome della chiave, oppure "general" se nessuno corrisponde."""
+Possibili: "calendar", "email", "general". Restituisci SOLO il nome."""
     response = await llm_client.chat(
-        message=f"Input: {text}\n\nAgente principale:",
+        message=f"Input: {text}\n\nAgente:",
         system_prompt=system_prompt
     )
     agent_name = response.strip().lower()
     return agent_name if agent_name in ["calendar", "email", "general"] else "general"
 
-# === Startup: avvia polling in thread separato ===
+# === Critical: Polling with proper event loop per thread ===
 def run_bot_polling():
-    """Funzione per avviare il polling Telegram in un thread separato"""
+    """Funzione che avvia il polling Telegram in un thread con proprio event loop."""
     try:
-        bot.polling(none_stop=True, interval=2, timeout=20)
+        # Crea un event loop dedicato per questo thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            bot.polling(none_stop=True, interval=2, timeout=20)
+        finally:
+            loop.close()
     except Exception as e:
-        logging.error(f"Errore polling Telegram: {e}")
+        logging.error(f"Errore critico polling Telegram: {e}")
 
-# Avvia il polling in background quando FastAPI parte
-import threading
+# Avvia il polling in background thread
 polling_thread = threading.Thread(target=run_bot_polling, daemon=True)
 polling_thread.start()
 
-logging.info("🚀 Avvio Segretaria Personale Bot - Polling attivo e risposta garantita")
+logging.info("🚀 Avvio Segretaria Personale Bot - Polling Telegram avviato in background")
+
+# === FastAPI Routes ===
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Bot attivo - polling in esecuzione"}
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
 
 # === Telegram Handlers ===
 
@@ -145,10 +162,10 @@ def cmd_start(message):
     bot.send_message(
         message.chat.id,
         "👋 Ciao! Sono la tua Segretaria Personale.\n\n"
-        "Sono attivi questi servizi:\n"
+        "Servizi attivi:\n"
         "• 📅 Gestione calendario\n"
         "• 📧 Gestione email\n"
-        "• 🤖 Risposte AI generiche\n\n"
+        "• 🤖 Risposte AI generative\n\n"
         "Scrivimi in italiano o inglese!\n"
         "Es: 'Aggiungi riunione con Marco domani 15:00'",
         parse_mode="HTML"
@@ -158,15 +175,8 @@ def cmd_start(message):
 def cmd_help(message):
     bot.send_message(
         message.chat.id,
-        "🤖 Comandi disponibili:\n"
-        "/start - Riavvia benvenuto\n"
-        "/help - Questo riassunto\n"
-        "/calendar - Agente calendario\n"
-        "/email - Agente email\n\n"
-        "Puoi anche scrivermi naturalmente:\n"
-        "• 'Quali sono i miei impegni?' → agenda\n"
-        "• 'Aggiungi riunione con Marco domani 15:00' → nuovo evento\n"
-        "• 'Riassumi le mie email' → posta elettronica",
+        "🤖 Comandi: /start /help /calendar /email\n"
+        "Scrivimi naturalmente: 'Quali sono i miei impegni?'",
         parse_mode="HTML"
     )
 
@@ -174,90 +184,77 @@ def cmd_help(message):
 def cmd_calendar(message):
     agent = agent_registry.get_agent("calendar")
     if agent:
-        bot.send_message(message.chat.id, "📅 Modalità calendario attivata! Scrivimi cosa vuoi fare.")
+        bot.send_message(message.chat.id, "📅 Modalità calendario attiva! Scrivimi cosa vuoi fare.")
     else:
-        bot.send_message(message.chat.id, "⚠️ Agente calendario in caricamento...")
+        bot.send_message(message.chat.id, "⚠️ Agente calendario in caricamento.")
 
 @bot.message_handler(commands=["email"])
 def cmd_email(message):
     agent = agent_registry.get_agent("email")
     if agent:
-        bot.send_message(message.chat.id, "📧 Modalità email attivata! Scrivimi cosa vuoi fare.")
+        bot.send_message(message.chat.id, "📧 Modalità email attiva! Scrivimi cosa vuoi fare.")
     else:
         bot.send_message(message.chat.id, "⚠️ Agente email in caricamento.")
 
 @bot.message_handler(func=lambda message: True)
 def handle_all_messages(message):
-    """Handler PRINCIPALE: rispponde SEMPRE a ogni messaggio.
+    """Handler PRINCIPALE: risponde SEMPRE a ogni messaggio.
     
-    Questa è la funzione chiave: garantisce che NESSUN messaggio venga ignorato.
+    Questa funzione garantisce che NESSUN messaggio venga ignorato.
+    Usa: agente specifico → LLM → fallback educato.
     """
     text = message.text or ""
     
-    # 1. Prima prova il routing LLM per trovare un agente specifico
+    # 1. Prova il routing LLM per trovare un agente
     agent_name = asyncio.get_event_loop().run_until_complete(route_message(text))
     agent = agent_registry.get_agent(agent_name)
     
-    # 2. Se un agente c'è, provaci
+    # 2. Se c'è un agente, provalo
     if agent:
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 asyncio.ensure_future(agent.handle_message(message, text))
-                # L'agentecalendar ha ora il suo propio messaggio di fallback,
-                # ma continuiamo comunque al fallback generale
             else:
-                resp = asyncio.get_event_loop().run_until_complete(agent.handle_message(message, text))
-                # Se l'agente ha risposto, usiamolo
+                resp = loop.run_until_complete(agent.handle_message(message, text))
                 if resp:
                     bot.send_message(message.chat.id, resp, parse_mode="HTML")
-                    return  # Messaggio gestito, esci
+                    return
         except Exception as e:
             logging.error(f"Errore agente {agent_name}: {e}")
     
-    # 3. FALLBACK: Se nessun agente ha risposto, o non c'era l'agente, prova LLM
+    # 3. FALLBACK: LLM se nessun agente ha risposto
     if llm_client:
         try:
-            sys_prompt = """Sei la Segretaria Personale AI amichevole ed efficiente.
-L'utente ti ha appena scritto: """ + text + """
-Rispondi in italiano in modo conciso e utile. Se l'utente chiede qualcosa di relativo al calendario, email o generico, rispondi appropriatamente.
-Mantieni le risposte brevi (massimo 2-3 frasi). Se non sai qualcosa, dillo onestamente."""
+            sys_prompt = f"""Sei la Segretaria Personale AI amichevole.
+L'utente ha scritto: "{text}"
+Rispondi in italiano in modo conciso (max 2 frasi). Se non sai qualcosa, dillo onestamente."""
             resp = asyncio.get_event_loop().run_until_complete(
                 llm_client.chat(message=text, system_prompt=sys_prompt)
             )
             if resp and resp.strip():
                 bot.send_message(message.chat.id, resp, parse_mode="HTML")
-                return  # Messaggio gestito da LLM
+                return
         except Exception as e:
             logging.error(f"Errore LLM fallback: {e}")
     
-    # 4. ULTIMO RISORTO: Messaggio di default se nulla altro funziona
+    # 4. ULTIMO RISORTO: Messaggio di default educato
     bot.send_message(
         message.chat.id,
-        "🤖 Ho ricevuto il tuo messaggio! Sto elaborando la richiesta...\n\n"
-        "Non sono riuscito a capire esattamente cosa volevi, ma ecco cosa posso fare:\n"
-        "• Scrivimi 'Quali sono i miei impegni?' per vedere il calendario\n"
+        "🤖 Ho ricevuto il tuo messaggio! Sto elaborando...\n\n"
+        "Non sono riuscito a capire esattamente cosa volevi, ma ecco le opzioni:\n"
+        "• Scrivimi 'Quali sono i miei impegni?' per il calendario\n"
         "• Scrivimi 'Aggiungi riunione con Nome data ora' per nuovi eventi\n"
-        "• Scrivimi 'Help' per tutti i comandi disponibili\n\n"
+        "• Scrivimi 'Help' per tutti i comandi\n\n"
         "Riprova o dimmi chiaramente cosa vuoi fare! 👇",
         parse_mode="HTML"
     )
 
-# === FastAPI Routes ===
-
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "Bot attivo - polling in corso"}
-
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
-
 # === Lifespan Events ===
 @app.on_event("startup")
 def startup_event():
-    logging.info("✅ Bot avviato - Polling Telegram in esecuzione in background")
-    logging.info("🔒 Garantito: ogni messaggio riceverà una risposta")
+    logging.info("✅ Bot avviato - Polling Telegram in esecuzione in background thread")
+    logging.info("🔒 Garanzia: ogni messaggio riceverà una risposta")
 
 @app.on_event("shutdown")
 def shutdown_event():
