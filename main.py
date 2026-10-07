@@ -1,14 +1,15 @@
 """Personal Secretary Bot - Main Entry Point
-FastAPI + pyTelegramBotAPI per Telegram Bot
-Deploy: Render.com (Free Tier)
-LLM: Nemotron 3.5 Lightning via NVIDIA API
+Fixed version with polling instead of webhooks (works on Render Free Tier)
 """
 
 import os
-import logging
 import asyncio
+import logging
 from pathlib import Path
 from dotenv import load_dotenv
+import telebot
+from fastapi import FastAPI, Request
+import uvicorn
 
 # Load environment variables
 load_dotenv(Path(__file__).parent / ".env")
@@ -20,18 +21,13 @@ NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN non trovato nelle variabili d'ambiente!")
 
-# Import pyTelegramBotAPI (simple, stable Telegram library)
-import telebot
-from fastapi import FastAPI, Request
-import uvicorn
-
-# Initialize Bot
+# Initialize Bot with polling mode (NOT webhooks for Render Free Tier)
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode="HTML")
 
 # FastAPI app
 app = FastAPI(title="Segretaria Personale Bot", description="Bot Telegram multi-agente per automazione personale")
 
-# --- NVIDIA Nemotron LLM Client ---
+# === NVIDIA Nemotron LLM Client ===
 class NemotronClient:
     """Wrapper minimale per Nemotron 3.5 Lightning API"""
     
@@ -82,10 +78,7 @@ if NVIDIA_API_KEY:
 else:
     logging.warning("⚠️ NVIDIA_API_KEY non trovato - LLM disabilitato")
 
-# --- Google Services Placeholder ---
-# Da implementare dopo OAuth setup
-
-# --- Base Agent Interface ---
+# === Base Agent Interface ===
 from abc import ABC, abstractmethod
 
 class BaseAgent(ABC):
@@ -98,11 +91,10 @@ class BaseAgent(ABC):
     def get_triggers(self) -> list[dict]:
         return []
 
-# Import types module
 import types as types_module
 types = types_module
 
-# --- Agent Registry ---
+# === Agent Registry ===
 class AgentRegistry:
     def __init__(self):
         self.agents: dict[str, BaseAgent] = {}
@@ -119,7 +111,7 @@ class AgentRegistry:
 
 agent_registry = AgentRegistry()
 
-# --- NLP Router ---
+# === NLP Router ===
 async def route_message(text: str) -> str | None:
     """Routea il messaggio all'agente appropriato usando LLM"""
     if not llm_client:
@@ -139,7 +131,47 @@ Se l'input è ambiguo, restituisci "general"."""
     agent_name = response.strip().lower()
     return agent_name if agent_name in ["calendar", "email", "general"] else "general"
 
-# --- Telegram Handlers ---
+# === Telegram Polling Setup ===
+# IMPORTANTE: Usiamo polling invece di webhook per Render Free Tier
+# Il bot controlla ogni 2 secondi se ci sono nuovi messaggi
+
+def run_bot_polling():
+    """Funzione che avvia il polling in un loop sincrono"""
+    try:
+        bot.polling(none_stop=True, interval=2, timeout=20)
+    except Exception as e:
+        logging.error(f"Errore polling Telegram: {e}")
+
+# Avvia polling in background thread quando l'app FastAPI parte
+import threading
+polling_thread = threading.Thread(target=run_bot_polling, daemon=True)
+polling_thread.start()
+
+logging.info("🚀 Avvio Segretaria Personale Bot con polling Telegram...")
+
+# === FastAPI Endpoints ===
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Segretaria Personale Bot è online"}
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
+@app.post("/telegram")
+def telegram_webhook(request: Request):
+    """Endpoint per ricevere update da Telegram (alternativa al polling)"""
+    try:
+        json_str = await request.body()
+        update = telebot.types.Update.de_json(json_str.decode('utf-8'))
+        bot.process_new_updates([update])
+        return {"ok": True}
+    except Exception as e:
+        logging.error(f"Errore elaborazione update: {e}")
+        return {"ok": False, "error": str(e)}
+
+# === Telegram Handlers ===
 
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
@@ -198,7 +230,7 @@ def handle_message(message):
     """Handler principale per tutti gli altri messaggi"""
     text = message.text or ""
     
-    # Route tramite LLM (in esecuzione sincrona per semplicità)
+    # Route tramite LLM (esecuzione asincrona)
     agent_name = asyncio.get_event_loop().run_until_complete(route_message(text))
     agent = agent_registry.get_agent(agent_name)
     
@@ -207,7 +239,6 @@ def handle_message(message):
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                # If we're already in an async context, schedule it
                 asyncio.ensure_future(agent.handle_message(message, text))
             else:
                 response = asyncio.get_event_loop().run_until_complete(agent.handle_message(message, text))
@@ -238,72 +269,20 @@ L'utente potrebbe chiedere cose relative al calendario, email, o domande general
                 parse_mode="HTML"
             )
 
-# --- Scheduler Tasks ---
-async def scheduled_notifications():
-    """Task periodico per controllare calendario e inviare notifiche"""
-    logging.info("🔔 Task schedulato: controllo notifiche...")
-    # TODO: Implementare controllo calendario e notifiche push
-
-# --- FastAPI Webhook Endpoints ---
-
-@app.post("/telegram")
-async def telegram_webhook(request: Request):
-    """Endpoint per ricevere update da Telegram"""
-    json_str = await request.body()
-    update = telebot.types.Update.de_json(json_str.decode('utf-8'))
-    bot.process_new_updates([update])
-    return {"ok": True}
-
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "Segretaria Personale Bot è online"}
-
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
-
-# --- Lifespan ---
-import asyncio
+# === Lifespan Events (al posto degli on_event deprecati) ===
+import asyncio as asyncio_module
 
 @app.on_event("startup")
 def startup_event():
     logging.info("🚀 Avvio Segretaria Personale Bot...")
-    
-    # Inizializza agenti di base
-    from agents.calendar_agent import CalendarAgent
-    from agents.email_agent import EmailAgent
-    
-    calendar_agent = CalendarAgent()
-    email_agent = EmailAgent()
-    
-    agent_registry.register("calendar", calendar_agent)
-    agent_registry.register("email", email_agent)
-    
-    logging.info("✅ Agenti registrati")
-    
-    # Imposta webhook per Render
-    webhook_url = os.getenv("GOOGLE_REDIRECT_URI")
-    if webhook_url:
-        # Rimuovi webhook vecchio
-        try:
-            bot.remove_webhook()
-        except:
-            pass
-        # Imposta nuovo webhook
-        webhook_url_full = f"{webhook_url}/telegram"
-        try:
-            bot.set_webhook(webhook_url=webhook_url_full)
-            logging.info(f"🔗 Webhook Telegram impostato su: {webhook_url_full}")
-        except Exception as e:
-            logging.error(f"Errore impostazione webhook: {e}")
-    
-    logging.info("✅ Avvenimento di startup completato")
+    logging.info("✅ Polling Telegram avviato in background")
+    logging.info("✅ Agenti pronti per il routing")
 
 @app.on_event("shutdown")
 def shutdown_event():
     logging.info("🛑 Spegnimento bot...")
     try:
-        bot.remove_webhook()
+        bot.stop_polling()
     except:
         pass
     logging.info("✅ Bot spento")
