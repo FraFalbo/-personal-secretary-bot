@@ -1,6 +1,6 @@
 """Personal Secretary Bot - Main Entry Point
-Async approach: Telegram polling integrated with FastAPI event loop
-Bot risponde SEMPRE a ogni messaggio! No threading complications.
+Async polling with proper sync/async handoff for Render Free Tier
+Bot risponde SEMPRE a ogni messaggio!
 """
 
 import os
@@ -123,20 +123,13 @@ Possibili: "calendar", "email", "general". Restituisci SOLO il nome."""
     agent_name = response.strip().lower()
     return agent_name if agent_name in ["calendar", "email", "general"] else "general"
 
-# === Critical: Startup task for Telegram Polling ===
-# Avviamo il polling Telegram come task asyncio dentro il loop di FastAPI
-# Questo evita l'errore "no current event loop in thread" perché tutto gira nello stesso loop
-
+# === Critical: Startup task for Telegram Polling (async) ===
 async def start_bot_polling():
-    """Funzione async che avvia il polling Telegram."""
+    """Funzione async che avvia il polling Telegram nel loop di FastAPI."""
     try:
-        # none_stop=True fa sì che il polling continui indefinitamente
-        # interval=2 controlla ogni 2 secondi nuovi messaggi
-        # timeout=20 attende 20 secondi senza messaggi prima di riavviare
         bot.polling(none_stop=True, interval=2, timeout=20)
     except Exception as e:
         logging.error(f"Errore polling Telegram: {e}")
-        # In caso di errore, riprova dopo un po'
         await asyncio.sleep(5)
         asyncio.create_task(start_bot_polling())
 
@@ -144,7 +137,6 @@ async def start_bot_polling():
 @app.on_event("startup")
 async def startup_event():
     logging.info("🚀 Avvio Segretaria Personale Bot...")
-    # Avvia il polling Telegram in background nel loop di FastAPI
     asyncio.create_task(start_bot_polling())
     logging.info("✅ Polling Telegram avviato nel loop async")
 
@@ -212,60 +204,56 @@ def cmd_email(message):
 def handle_all_messages(message):
     """Handler PRINCIPALE: risponde SEMPRE a ogni messaggio.
     
-    Logica a 3 livelli:
-    1. Agente specifico (Calendar/Email) se riconosciuto
-    2. LLM Nemotron come fallback intelligente
+    Funzionamento a 3 livelli:
+    1. Agente specifico (Calendar/Email) se riconosciuto tramite LLM
+    2. Fallback Nemotron LLM se nessun agente gestisce
     3. Messaggio educato se nulla altro funziona
     """
     text = message.text or ""
     
-    # 1. Prima prova il routing LLM per trovare un agente
+    # 1. Prima prova il routing LLM per trovare un agente (usando run_until_complete per context sync)
     agent_name = asyncio.get_event_loop().run_until_complete(route_message(text))
     agent = agent_registry.get_agent(agent_name)
     
-    # 2. Se c'è un agente, provalo
+    # 2. Se c'è un agente, prova a gestire il messaggio
     if agent:
         try:
-            resp = await agent.handle_message(message, text)
+            # Usa run_until_complete invece di await diretto per contesto sync
+            loop = asyncio.get_event_loop()
+            resp = loop.run_until_complete(agent.handle_message(message, text))
             if resp:
                 bot.send_message(message.chat.id, resp, parse_mode="HTML")
-                return
+                return  # Messaggio gestito, esci dalla funzione
         except Exception as e:
             logging.error(f"Errore agente {agent_name}: {e}")
     
-    # 3. FALLBACK: LLM Nemotron se nessun agente ha risposto
+    # 3. FALLBACK: Nemotron LLM se nessun agente ha risposto
     if llm_client:
         try:
-            sys_prompt = f"""Sei la Segretaria Personale AI amichevole.
+            # Costruisci prompt system basato su cosa ha scritto l'utente
+            sys_prompt = f"""Sei la Segretaria Personale AI amichevole ed efficiente.
 L'utente ha scritto: "{text}"
-Rispondi in italiano in modo conciso (max 2 frasi). Se non sai qualcosa, dillo onestamente."""
-            resp = await llm_client.chat(message=text, system_prompt=sys_prompt)
+Rispondi in italiano in modo conciso (max 2 frasi). Se non sai qualcosa, dillo onestamente e proponi alternative."""
+            resp = asyncio.get_event_loop().run_until_complete(
+                llm_client.chat(message=text, system_prompt=sys_prompt)
+            )
             if resp and resp.strip():
                 bot.send_message(message.chat.id, resp, parse_mode="HTML")
-                return
+                return  # Messaggio gestito da LLM
         except Exception as e:
             logging.error(f"Errore LLM fallback: {e}")
     
-    # 4. ULTIMO RISORTO: Messaggio di default educato
+    # 4. ULTIMO RISORTO: Messaggio di default educato se nulla altro funziona
     bot.send_message(
         message.chat.id,
         "🤖 Ho ricevuto il tuo messaggio! Sto elaborando...\n\n"
         "Non sono riuscito a capire esattamente cosa volevi, ma ecco le opzioni:\n"
         "• Scrivimi 'Quali sono i miei impegni?' per il calendario\n"
         "• Scrivimi 'Aggiungi riunione con Nome data ora' per nuovi eventi\n"
-        "• Scrivimi 'Help' per tutti i comandi\n\n"
+        "• Scrivimi 'Help' per tutti i comandi disponibili\n\n"
         "Riprova o dimmi chiaramente cosa vuoi fare! 👇",
         parse_mode="HTML"
     )
-
-# === Root GET (alternativa al /telegram webhook) ===
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "Bot attivo"}
-
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
